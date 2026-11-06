@@ -1,0 +1,35 @@
+---
+# Deploys the app to AKS. Runs on the GitHub runner (localhost) after azure/aks-set-context
+# has written ~/.kube/config.   Usage:
+#   ansible-playbook -i ansible/inventory.ini ansible/deploy.yml -e image=ghcr.io/<owner>/<repo>:<sha>
+- name: Deploy javaapp to AKS
+  hosts: local
+  gather_facts: false
+  vars:
+    k8s_dir: "{{ playbook_dir }}/../k8s"
+    image: "ghcr.io/OWNER/REPO:latest"   # always overridden with -e image=...
+
+  tasks:
+    - name: Ensure namespace exists
+      kubernetes.core.k8s:
+        state: present
+        src: "{{ k8s_dir }}/namespace.yaml"
+
+    - name: Apply Service (LoadBalancer)
+      kubernetes.core.k8s:
+        state: present
+        src: "{{ k8s_dir }}/service.yaml"
+
+    - name: Apply Deployment with the freshly built image and wait for rollout
+      kubernetes.core.k8s:
+        state: present
+        definition: >-
+          {{ lookup('file', k8s_dir ~ '/deployment.yaml')
+             | regex_replace('image: .*', 'image: ' ~ image)
+             | from_yaml }}
+        wait: true
+        wait_timeout: 300
+
+    - name: Report deployed image
+      ansible.builtin.debug:
+        msg: "Deployed {{ image }} to namespace javaapp"

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Java App on AKS</title>
+  <style>
+    body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;display:grid;place-items:center;min-height:100vh;margin:0}
+    .card{background:#1e293b;padding:2.5rem 3rem;border-radius:16px;text-align:center;box-shadow:0 10px 30px #0006}
+    h1{margin:0 0 .5rem;font-size:2rem}
+    .badge{display:inline-block;margin-top:1rem;padding:.35rem .8rem;border-radius:999px;background:#0ea5e9;color:#fff;font-family:monospace}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1 id="msg">Loading...</h1>
+    <div>Deployed version (git SHA):</div>
+    <span class="badge" id="ver">...</span>
+  </div>
+  <script>
+    fetch('/api/version').then(r => r.json()).then(d => {
+      document.getElementById('msg').textContent = d.message;
+      document.getElementById('ver').textContent = d.version;
+    }).catch(() => { document.getElementById('msg').textContent = 'API unreachable'; });
+  </script>
+</body>
+</html>

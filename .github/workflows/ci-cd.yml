@@ -1,0 +1,151 @@
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------- Stage 1: secret scanning ----------
+  secret-scan:
+    name: 1 - Gitleaks secret scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # scan full history, not just the last commit
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------- Stage 2: compile, test, package ----------
+  build-test:
+    name: 2 - Maven build and test
+    needs: secret-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Compile, run unit tests, package
+        run: mvn -B -ntp verify
+      - name: Test summary
+        if: always()
+        run: |
+          {
+            echo "### Unit test results"
+            for f in target/surefire-reports/*.txt; do
+              [ -f "$f" ] && sed -n '4p' "$f"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/app.jar
+          if-no-files-found: error
+
+  # ---------- Stage 3: container image -> GHCR ----------
+  docker:
+    name: 3 - Build, push and scan image (GHCR)
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_ref: ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.version }}
+      version: ${{ steps.vars.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: target
+      - name: Compute image name and version
+        id: vars
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "version=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push (SHA tag + latest)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            APP_VERSION=${{ steps.vars.outputs.version }}
+          tags: |
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.version }}
+            ${{ steps.vars.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Trivy image scan (report only; set exit-code to 1 to block on findings)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.version }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0'
+
+  # ---------- Stages 4-5: deploy to AKS and verify ----------
+  deploy:
+    name: 4 - Deploy to AKS and verify
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write          # required for Azure OIDC login
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure login (OIDC, no stored password)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Get AKS credentials
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ vars.AKS_RESOURCE_GROUP || 'rg-javaapp-devops' }}
+          cluster-name: ${{ vars.AKS_CLUSTER_NAME || 'aks-javaapp' }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Ansible and Kubernetes collection
+        run: |
+          pip install ansible-core kubernetes
+          ansible-galaxy collection install kubernetes.core
+      - name: Deploy with Ansible
+        run: |
+          ansible-playbook -i ansible/inventory.ini ansible/deploy.yml \
+            -e image=${{ needs.docker.outputs.image_ref }}
+      - name: Verify rollout and public endpoint
+        run: scripts/verify.sh "${{ needs.docker.outputs.version }}"
