@@ -1,6 +1,6 @@
 # Build once, ship that artifact: the pipeline runs `mvn verify` first and
 # downloads target/app.jar into the build context. Locally: mvn package && docker build .
-FROM eclipse-temurin:17-jre-alpine
+FROM eclipse-temurin:25-jre-alpine
 
 ARG APP_VERSION=dev
 ENV APP_VERSION=${APP_VERSION}
